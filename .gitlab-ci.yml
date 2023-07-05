@@ -1,0 +1,118 @@
+image: "maven:3-eclipse-temurin-17-alpine"
+
+stages:
+  - test
+  - security_test
+  - build
+  - publish
+  - deploy
+
+variables:
+  MAVEN_CLI_OPTS: " --batch-mode"
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  KUBERNETES_SERVICE_ACCOUNT: "default/gitlab-runner"
+
+cache:
+  paths:
+    - .m2/repository/
+
+
+test:
+  stage: test
+  script:
+    - mvn $MAVEN_CLI_OPTS verify
+  artifacts:
+    when: always
+    reports:
+      junit:
+        - target/surefire-reports/TEST-*.xml
+        - target/failsafe-reports/TEST-*.xml
+
+analyze-sonar:
+  stage: security_test
+  script:
+    - mvn $MAVEN_CLI_OPTS clean compile sonar:sonar -Dsonar.projectKey="$SONAR_PROJECT_KEY" -Dsonar.token="$SONAR_TOKEN" -Dsonar.host.url="$SONAR_HOST_URL"
+
+
+compile:
+  stage: build
+  script:
+    - mvn $MAVEN_CLI_OPTS compile -Dmaven.test.skip
+
+package-and-publish-docker:
+  stage: publish
+  image: docker:24
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: /certs/client
+  script:
+    - docker build -t spring-petclinic .
+    - docker image tag spring-petclinic $DOCKER_REGISTRY/spring-petclinic:latest
+    - docker login $DOCKER_REGISTRY -u "$DOCKER_REGISTRY_USER" -p "$DOCKER_REGISTRY_PASSWORD"
+    - docker push $DOCKER_REGISTRY/spring-petclinic:latest
+
+
+deploy:dev:
+  stage: deploy
+  image: alpine/helm
+  when: manual
+  dependencies: []
+  variables:
+    K8S_NAMESPACE: default
+  before_script:
+    - |
+      curl -LO https://storage.googleapis.com/kubernetes-release/release/v1.22.9/bin/linux/amd64/kubectl
+      chmod +x ./kubectl
+      mv ./kubectl /usr/bin/kubectl
+      if [ -n "$K8S_CI_TOKEN" ]; then
+        echo "Variable K8S_CI_TOKEN is defined. Use it to create kube-context"
+        if [ -n "$K8S_API_URL" ]; then
+          echo "Variable K8S_API_URL is defined. Use to it for k8s cluster connection"
+        else
+          echo "Error: Variable K8S_API_URL is not defined!"
+          exit 1
+        fi
+        echo "K8s cluster URL: $K8S_API_URL"
+        echo "K8s cluster namespace: ${K8S_NAMESPACE:-default}"
+        kubectl config set-cluster k8s --insecure-skip-tls-verify=true --server=$K8S_API_URL
+        kubectl config set-credentials ci --token="$(echo $K8S_CI_TOKEN | base64 -d)"
+        kubectl config set-context ci --cluster=k8s --user=ci --namespace=$K8S_NAMESPACE
+        kubectl config use-context ci
+      fi
+  script:
+    - cd charts
+    - helm install demo ./spring-petclinic
+
+destroy:dev:
+  stage: deploy
+  image: alpine/helm
+  when: manual
+  dependencies: []
+  variables:
+    K8S_NAMESPACE: default
+  before_script:
+    - |
+      curl -LO https://storage.googleapis.com/kubernetes-release/release/v1.22.9/bin/linux/amd64/kubectl
+      chmod +x ./kubectl
+      mv ./kubectl /usr/bin/kubectl
+      if [ -n "$K8S_CI_TOKEN" ]; then
+        echo "Variable K8S_CI_TOKEN is defined. Use it to create kube-context"
+        if [ -n "$K8S_API_URL" ]; then
+          echo "Variable K8S_API_URL is defined. Use to it for k8s cluster connection"
+        else
+          echo "Error: Variable K8S_API_URL is not defined!"
+          exit 1
+        fi
+        echo "K8s cluster URL: $K8S_API_URL"
+        echo "K8s cluster namespace: ${K8S_NAMESPACE:-default}"
+        kubectl config set-cluster k8s --insecure-skip-tls-verify=true --server=$K8S_API_URL
+        kubectl config set-credentials ci --token="$(echo $K8S_CI_TOKEN | base64 -d)"
+        kubectl config set-context ci --cluster=k8s --user=ci --namespace=$K8S_NAMESPACE
+        kubectl config use-context ci
+      fi
+  script:
+    - helm uninstall demo
